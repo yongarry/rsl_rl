@@ -12,7 +12,7 @@ import torch
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, Distillation
+from rsl_rl.algorithms import PPO, Distillation, AMP
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -42,6 +42,8 @@ class OnPolicyRunner:
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
+        elif self.alg_cfg["class_name"] == "AMP":
+            self.training_type = "rl"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
@@ -93,7 +95,7 @@ class OnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(
+        self.alg: PPO | Distillation | AMP = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
@@ -270,7 +272,9 @@ class OnPolicyRunner:
                 self.log(locals())
                 # Save model
                 if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                    self.save(os.path.join(self.log_dir, f"model.pt"))
+                    if it % (self.save_interval * 10) == 0:
+                        self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             # Clear episode infos
             ep_infos.clear()

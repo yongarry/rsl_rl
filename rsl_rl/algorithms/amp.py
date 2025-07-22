@@ -11,13 +11,14 @@ import torch.optim as optim
 from itertools import chain
 
 from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import Discriminator
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable
 
 
-class PPO:
-    """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
+class AMP:
+    """AMP algorithm (https://arxiv.org/abs/2104.02180)."""
 
     policy: ActorCritic
     """The actor critic module."""
@@ -49,6 +50,8 @@ class PPO:
         lcp_cfg: dict | None = None,
         # Bound loss parameters
         bound_loss_cfg: dict | None = None,
+        # AMP parameters
+        amp_cfg: dict | None = None,
     ):
         # device-related parameters
         self.device = device
@@ -108,8 +111,20 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
+
+        # AMP components
+        self.amp_cfg = amp_cfg
+        self.discriminator = Discriminator(**self.amp_cfg).to(self.device)
+        self.amp_storage = ReplayBuffer(self.discriminator.num_amp_obs // 2, self.amp_cfg["amp_replay_buffer_size"], self.device)
+        self.amp_transition = RolloutStorage.Transition()
+
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        params = [
+            {"params": self.policy.parameters(), "name": "policy"},
+            {"params": self.discriminator.parameters(), "name": "disc"},
+        ]
+        self.optimizer = optim.Adam(params, lr=learning_rate)
+
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -149,7 +164,7 @@ class PPO:
             self.device,
         )
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, amp_obs=None):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
@@ -161,9 +176,10 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
+        self.amp_transition.observations = amp_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos):
+    def process_env_step(self, rewards, dones, infos, amp_obs):
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -187,9 +203,12 @@ class PPO:
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
+        # Record the AMP observations
+        self.amp_storage.insert(self.amp_transition.observations, amp_obs)
         # record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
+        self.amp_transition.clear()
         self.policy.reset(dones)
 
     def compute_returns(self, last_critic_obs):
@@ -203,6 +222,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_discriminator_loss = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -229,6 +249,16 @@ class PPO:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
+        # AMP generator
+        amp_policy_generator = self.amp_storage.feed_forward_generator(
+            self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env //
+                self.num_mini_batches)
+        amp_expert_generator = self.amp_data.feed_forward_generator(
+            self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env //
+                self.num_mini_batches)
 
         # iterate over batches
         for (
