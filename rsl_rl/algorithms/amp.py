@@ -12,6 +12,7 @@ from itertools import chain
 
 from rsl_rl.modules import ActorCritic
 from rsl_rl.modules import Discriminator
+from rsl_rl.amp_motion_loader import AMPTocabiMotionLoader
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable
@@ -114,9 +115,15 @@ class AMP:
 
         # AMP components
         self.amp_cfg = amp_cfg
-        self.discriminator = Discriminator(**self.amp_cfg).to(self.device)
-        self.amp_storage = ReplayBuffer(self.discriminator.num_amp_obs // 2, self.amp_cfg["amp_replay_buffer_size"], self.device)
+        self.disc_cfg = self.amp_cfg["disc_cfg"]
+        assert self.amp_cfg is not None, "AMP configuration is not provided."
+        self.discriminator = Discriminator(
+            num_amp_obs=self.amp_cfg["num_amp_obs_per_step"] * self.amp_cfg["num_amp_obs_steps"],
+            **self.disc_cfg
+        ).to(self.device)
+        self.amp_storage = ReplayBuffer(self.discriminator.num_amp_obs, self.amp_cfg["amp_replay_buffer_size"], self.device)
         self.amp_transition = RolloutStorage.Transition()
+        self.amp_data = AMPTocabiMotionLoader(self.amp_cfg["motion_file"], self.amp_cfg["num_amp_obs_steps"], self.amp_cfg["env_dt"], self.device)
 
         # Create optimizer
         params = [
@@ -164,7 +171,7 @@ class AMP:
             self.device,
         )
 
-    def act(self, obs, critic_obs, amp_obs=None):
+    def act(self, obs, critic_obs, amp_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
@@ -222,7 +229,8 @@ class AMP:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        mean_discriminator_loss = 0
+        mean_disc_loss = 0
+        mean_disc_pen_loss = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -261,21 +269,21 @@ class AMP:
                 self.num_mini_batches)
 
         # iterate over batches
-        for (
-            obs_batch,
-            critic_obs_batch,
-            actions_batch,
-            target_values_batch,
-            advantages_batch,
-            returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
-            hid_states_batch,
-            masks_batch,
-            rnd_state_batch,
-        ) in generator:
 
+        for (ppo_batch, amp_policy_batch, amp_expert_batch) in zip(generator, amp_policy_generator, amp_expert_generator):
+            # unpack the PPO batch
+            (   obs_batch, 
+                critic_obs_batch,
+                actions_batch,
+                target_values_batch,
+                advantages_batch,
+                returns_batch,
+                old_actions_log_prob_batch,
+                old_mu_batch,
+                old_sigma_batch,
+                hid_states_batch,
+                masks_batch,
+                rnd_state_batch) = ppo_batch
             # number of augmentations per sample
             # we start with 1 and increase it if we use symmetry augmentation
             num_aug = 1
@@ -312,8 +320,11 @@ class AMP:
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
             if self.use_lcp:
+                print(f"obs_batch.requires_grad: {obs_batch.requires_grad}")
                 obs_est_batch = obs_batch.clone()
                 obs_est_batch.requires_grad_()
+                print(f"obs_batch.requires_grad: {obs_batch.requires_grad}")
+                print(f"obs_est_batch.requires_grad: {obs_est_batch.requires_grad}")
                 self.policy.act(obs_est_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             else:
                 self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -338,7 +349,7 @@ class AMP:
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
                         / (2.0 * torch.square(sigma_batch))
                         - 0.5,
-                        axis=-1,
+                        dim=-1,
                     )
                     kl_mean = torch.mean(kl)
 
@@ -386,8 +397,46 @@ class AMP:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Discriminator loss
+            policy_amp_obs = amp_policy_batch
+            expert_amp_obs = amp_expert_batch
 
+            policy_disc_output = self.discriminator.discriminate(policy_amp_obs)
+            expert_disc_output = self.discriminator.discriminate(expert_amp_obs)
+
+            assert self.amp_cfg is not None, "AMP configuration is not provided."
+            if self.disc_cfg["gan_type"] == "vanilla":
+                policy_loss = torch.nn.BCEWithLogitsLoss()(policy_disc_output, torch.zeros(policy_disc_output.size(), device=self.device))
+                expert_loss = torch.nn.BCEWithLogitsLoss()(expert_disc_output, torch.ones(expert_disc_output.size(), device=self.device))
+                grad_pen_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
+                disc_loss = (expert_loss + policy_loss) *0.5
+            elif self.disc_cfg["gan_type"] == "lsgan":
+                # LSGAN
+                policy_loss = torch.nn.MSELoss()(
+                    policy_disc_output, -1 * torch.ones(policy_disc_output.size(), device=self.device))
+                expert_loss = torch.nn.MSELoss()(
+                    expert_disc_output, torch.ones(expert_disc_output.size(), device=self.device))
+                grad_pen_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
+                disc_loss = (expert_loss + policy_loss) *0.5
+            elif self.disc_cfg["gan_type"] == "wgan":
+                # WGAN
+                alpha = 0.5 # 0.1 ~ 0.5 is recommended
+                policy_loss = torch.nn.Tanh()(policy_disc_output * alpha).mean()
+                expert_loss = -torch.nn.Tanh()(expert_disc_output * alpha).mean()
+                grad_pen_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
+                disc_loss = (expert_loss + policy_loss) *0.5
+            else:
+                assert False, f"Invalid GAN type: {self.disc_cfg['gan_type']}"
+
+            disc_logit_loss = torch.sum(torch.square(self.discriminator.get_logit_weight()))
+
+            loss = surrogate_loss \
+                + self.value_loss_coef * value_loss \
+                - self.entropy_coef * entropy_batch.mean() \
+                + self.amp_cfg["disc_loss_coef"] * disc_loss \
+                + self.amp_cfg["disc_logit_loss_coef"] * disc_logit_loss \
+                + grad_pen_loss
+            
             # Symmetry loss
             if self.symmetry:
                 # obtain the symmetric actions
@@ -445,6 +494,7 @@ class AMP:
             # -- For PPO
             self.optimizer.zero_grad()
             loss.backward()
+            print(f"backward done")
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
@@ -466,6 +516,8 @@ class AMP:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_disc_loss += disc_loss.item()
+            # mean_disc_pen_loss += grad_pen_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -484,6 +536,9 @@ class AMP:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        # -- For Discriminator loss
+        mean_disc_loss /= num_updates
+        mean_disc_pen_loss /= num_updates
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -504,6 +559,8 @@ class AMP:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "disc": mean_disc_loss,
+            "disc_pen": mean_disc_pen_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -564,7 +621,7 @@ class AMP:
                 offset += numel
 
     def _calc_grad_penalty(self, obs_batch, actions_log_prob_batch):
-        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True)[0]
+        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True, retain_graph=True)[0]
         gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
         return gradient_penalty_loss
     

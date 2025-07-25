@@ -19,8 +19,10 @@ class Discriminator(nn.Module):
         num_amp_obs,
         num_amp_output,
         hidden_dims=[256, 256],
-        activation="elu",
+        activation="relu",
         normalize_amp_obs=True,
+        amp_reward_weight=1.0,
+        gan_type="vanilla",
         **kwargs,
     ):
         if kwargs:
@@ -29,6 +31,9 @@ class Discriminator(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
+        self.num_amp_obs = num_amp_obs
+        self.amp_reward_weight = amp_reward_weight
+        self.gan_type = gan_type
 
         activation = resolve_nn_activation(activation)
 
@@ -49,7 +54,7 @@ class Discriminator(nn.Module):
         else:
             self.amp_normalizer = None
 
-        print(f"Discriminator MLP: {self.disc}")
+        print(f"Discriminator MLP with {self.gan_type} type: {self.disc}")
 
 
     @staticmethod
@@ -70,8 +75,60 @@ class Discriminator(nn.Module):
         if self.amp_normalizer is not None:
             observations = self.amp_normalizer(observations)
         return self.disc(observations)
+    
+    def calc_amp_reward(self, observations):
+        with torch.no_grad():
+            self.eval()
+            disc_output = self.discriminate(observations)
+            if self.gan_type == "vanilla":
+                prob = torch.sigmoid(disc_output)
+                amp_reward = torch.log(torch.maximum(1 - prob, torch.tensor(1e-8)))
+            elif self.gan_type == "lsgan":
+                amp_reward = torch.maximum(1.0 - 0.25 * torch.square(disc_output - 1.0), torch.tensor(0.0))
+            elif self.gan_type == "wgan":
+                amp_reward = torch.exp(disc_output)
+            else:
+                assert False, f"Invalid GAN type: {self.gan_type}"
+            self.train()
+            return self.amp_reward_weight * amp_reward.squeeze()
 
+    def compute_grad_pen(self, demo_amp_obs, lambda_=10):
+        print(f"demo_amp_obs.requires_grad: {demo_amp_obs.requires_grad}")
+        demo_amp_obs_est = demo_amp_obs.detach().clone()
+        demo_amp_obs_est.requires_grad_()
+        print(f"demo_amp_obs.requires_grad: {demo_amp_obs.requires_grad}")
 
+        disc = self.discriminate(demo_amp_obs_est)
+        print(f"disc.requires_grad: {disc.requires_grad}")
+        ones = torch.ones(disc.size(), device=disc.device)
+        grad = torch.autograd.grad( # Computes the gradients of outputs w.r.t. inputs.
+            outputs=disc, inputs=demo_amp_obs_est,
+            grad_outputs=ones, create_graph=True,
+            retain_graph=True, only_inputs=True)[0] # the index [0] indicates gradient w.r.t. the first input. For multiple inputs, use inputs=[input1, input2]
+
+        # Enforce that the grad norm approaches 0.
+        grad_pen = lambda_ * (grad.norm(2, dim=1) - 0).pow(2).mean()
+        # grad_pen = lambda_ * torch.sum(torch.square(grad), dim=-1).mean()
+        return grad_pen
+    
+    def compute_grad_pen_interpolate(self, expert_amp_obs, policy_amp_obs, lambda_=10):
+        interpolate_data = slerp(expert_amp_obs, policy_amp_obs, torch.rand((expert_amp_obs.shape[0], 1)))
+
+        disc = self.discriminate(interpolate_data)
+        ones = torch.ones(disc.size(), device=disc.device)
+        grad = torch.autograd.grad( # Computes the gradients of outputs w.r.t. inputs.
+            outputs=disc, inputs=interpolate_data,
+            grad_outputs=ones, create_graph=True,
+            retain_graph=True, only_inputs=True)[0] # the index [0] indicates gradient w.r.t. the first input. For multiple inputs, use inputs=[input1, input2]
+
+        # Enforce that the grad norm approaches 0.
+        # grad_pen = lambda_ * (grad.norm(2, dim=1) - 0).pow(2).mean()
+        grad_pen = lambda_ * (torch.clamp(grad.norm(2, dim=1) - 1., min=0.)).pow(2).mean()
+        return grad_pen
+    
+    def get_logit_weight(self):
+        return torch.flatten(self.disc[-1].weight)
+    
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.
 
@@ -87,3 +144,7 @@ class Discriminator(nn.Module):
 
         super().load_state_dict(state_dict, strict=strict)
         return True
+    
+@staticmethod
+def slerp(a, b, blend):
+    return (1-blend)*a + blend*b

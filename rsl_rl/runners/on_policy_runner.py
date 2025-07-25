@@ -37,15 +37,16 @@ class OnPolicyRunner:
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
 
+        self.alg_class_name = self.alg_cfg["class_name"]
         # resolve training type depending on the algorithm
-        if self.alg_cfg["class_name"] == "PPO":
+        if self.alg_class_name == "PPO":
             self.training_type = "rl"
-        elif self.alg_cfg["class_name"] == "Distillation":
+        elif self.alg_class_name == "Distillation":
             self.training_type = "distillation"
-        elif self.alg_cfg["class_name"] == "AMP":
+        elif self.alg_class_name == "AMP":
             self.training_type = "rl"
         else:
-            raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
+            raise ValueError(f"Training type not found for algorithm {self.alg_class_name}.")
 
         # resolve dimensions of observations
         obs, extras = self.env.get_observations()
@@ -92,6 +93,8 @@ class OnPolicyRunner:
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
+        if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"] is not None:
+            self.alg_cfg["amp_cfg"]["env_dt"] = env.unwrapped.step_dt
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
@@ -169,6 +172,9 @@ class OnPolicyRunner:
 
         # start learning
         obs, extras = self.env.get_observations()
+        if self.alg_class_name == "AMP":
+            amp_obs = extras["observations"]["amp_obs"]
+            amp_obs = amp_obs.to(self.device)
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -203,12 +209,23 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    # whether self.alg class is AMP or not
+                    if self.alg_class_name == "AMP":
+                        actions = self.alg.act(obs, privileged_obs, amp_obs)
+                    else:
+                        actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    if self.alg_class_name == "AMP":
+                        amp_obs = infos["observations"]["amp_obs"]
+                        amp_obs = amp_obs.to(self.device)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # perform normalization
+                    if self.alg_class_name == "AMP":
+                        amp_reward = self.alg.discriminator.calc_amp_reward(amp_obs)
+                        rewards = rewards * self.alg.amp_cfg["task_reward_ratio"] + amp_reward * (1 - self.alg.amp_cfg["task_reward_ratio"])
+
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(
@@ -216,9 +233,12 @@ class OnPolicyRunner:
                         )
                     else:
                         privileged_obs = obs
-
-                    # process the step
-                    self.alg.process_env_step(rewards, dones, infos)
+ 
+                    if self.alg_class_name == "AMP":
+                        self.alg.process_env_step(rewards, dones, infos, amp_obs)
+                    else:
+                        # process the step
+                        self.alg.process_env_step(rewards, dones, infos)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None

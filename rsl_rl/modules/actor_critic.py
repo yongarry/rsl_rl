@@ -147,3 +147,102 @@ class ActorCritic(nn.Module):
 
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+class ActorCritic_SN(ActorCritic):
+    is_recurrent = False
+
+    def __init__(
+        self,
+        num_actor_obs,
+        num_critic_obs,
+        num_actions,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[256, 256, 256],
+        activation="elu",
+        init_noise_std=1.0,
+        noise_std_type: str = "scalar",
+        lipschitz_constant=1.0,
+        **kwargs,
+    ):
+        if kwargs:
+            print(
+                "ActorCritic.__init__ got unexpected arguments, which will be ignored: "
+                + str([key for key in kwargs.keys()])
+            )
+        super().__init__(num_actor_obs, num_critic_obs, num_actions, actor_hidden_dims, critic_hidden_dims, activation, init_noise_std, noise_std_type, **kwargs)
+
+        # replace the actor and critic with spectral norm layers
+        mlp_input_dim_a = num_actor_obs
+        mlp_input_dim_c = num_critic_obs
+        # Policy
+        actor_layers = []
+        actor_layers.append(sn_linear(mlp_input_dim_a, actor_hidden_dims[0]))
+        actor_layers.append(activation)
+        for layer_index in range(len(actor_hidden_dims)):
+            if layer_index == len(actor_hidden_dims) - 1:
+                actor_layers.append(sn_scaled_linear(actor_hidden_dims[layer_index], num_actions, lipschitz_constant))
+            else:
+                actor_layers.append(sn_linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
+                actor_layers.append(activation)
+        self.actor = nn.Sequential(*actor_layers)
+
+        # Value function
+        critic_layers = []
+        critic_layers.append(sn_linear(mlp_input_dim_c, critic_hidden_dims[0]))
+        critic_layers.append(activation)
+        for layer_index in range(len(critic_hidden_dims)):
+            if layer_index == len(critic_hidden_dims) - 1:
+                critic_layers.append(sn_scaled_linear(critic_hidden_dims[layer_index], 1, lipschitz_constant))
+            else:
+                critic_layers.append(sn_linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
+                critic_layers.append(activation)
+        self.critic = nn.Sequential(*critic_layers)
+
+        print(f"Actor with SN MLP: {self.actor}")
+        print(f"Critic with SN MLP: {self.critic}")
+
+
+########################################################################################################
+# spectral norm layers
+########################################################################################################
+
+def sn_scaled_linear(input_size, unit, lipschitz_constant=1.0):
+    layer = nn.utils.spectral_norm(nn.Linear(input_size, unit)) #, eps=1e-6)
+    return ScaledLinear(layer, lipschitz_constant)
+
+def sn_linear(input_size, unit):
+    return nn.utils.spectral_norm(nn.Linear(input_size, unit))#, eps=1e-6)
+
+class ScaledLinear(nn.Module):
+    """Wrapper to scale the output of spectral norm layers"""
+    def __init__(self, layer, lipschitz_constant):
+        super().__init__()
+        self.layer = layer
+        self.lipschitz_constant = lipschitz_constant  # Scaling factor
+
+    # def forward(self, x, scale):
+        # scale = scale.to(x.device)
+        # return nn.functional.linear(x, scale * self.layer.weight.to(x.device), self.layer.bias.to(scale.device))
+    def forward(self, x):
+        return self.lipschitz_constant * self.layer(x)  
+        # return nn.functional.linear(x, self.lipschitz_constant * self.layer.weight.to(x.device), self.layer.bias.to(x.device))
+        # return nn.functional.linear(x, self.lipschitz_constant * self.layer.weight, self.layer.bias)
+
+    # def lipschitz_update(self, progress_remaining):
+        # if (progress_remaining > 0.5):
+            # self.lipschitz_constant = 1 - 1.6 * (1 - progress_remaining)
+            # self.lipschitz_constant = 1.0
+        # else:
+            # self.lipschitz_constant = 0.2
+    def lipschitz_update(self, sigma):
+        self.lipschitz_constant = sigma
+
+    @property
+    def weight(self):
+        """Expose the weight of the underlying layer"""
+        return self.layer.weight  
+
+    @property
+    def bias(self):
+        """Expose the bias of the underlying layer (if exists)"""
+        return self.layer.bias  
