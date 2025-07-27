@@ -93,13 +93,12 @@ class Discriminator(nn.Module):
             return self.amp_reward_weight * amp_reward.squeeze()
 
     def compute_grad_pen(self, demo_amp_obs, lambda_=10):
-        print(f"demo_amp_obs.requires_grad: {demo_amp_obs.requires_grad}")
         demo_amp_obs_est = demo_amp_obs.detach().clone()
-        demo_amp_obs_est.requires_grad_()
-        print(f"demo_amp_obs.requires_grad: {demo_amp_obs.requires_grad}")
 
-        disc = self.discriminate(demo_amp_obs_est)
-        print(f"disc.requires_grad: {disc.requires_grad}")
+        # disc = self.discriminate(demo_amp_obs_est)
+        demo_amp_obs_est = self.amp_normalizer(demo_amp_obs_est)
+        demo_amp_obs_est.requires_grad_()
+        disc = self.disc(demo_amp_obs_est)
         ones = torch.ones(disc.size(), device=disc.device)
         grad = torch.autograd.grad( # Computes the gradients of outputs w.r.t. inputs.
             outputs=disc, inputs=demo_amp_obs_est,

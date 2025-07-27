@@ -115,8 +115,8 @@ class AMP:
 
         # AMP components
         self.amp_cfg = amp_cfg
-        self.disc_cfg = self.amp_cfg["disc_cfg"]
         assert self.amp_cfg is not None, "AMP configuration is not provided."
+        self.disc_cfg = self.amp_cfg["disc_cfg"]
         self.discriminator = Discriminator(
             num_amp_obs=self.amp_cfg["num_amp_obs_per_step"] * self.amp_cfg["num_amp_obs_steps"],
             **self.disc_cfg
@@ -320,11 +320,8 @@ class AMP:
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
             if self.use_lcp:
-                print(f"obs_batch.requires_grad: {obs_batch.requires_grad}")
                 obs_est_batch = obs_batch.clone()
                 obs_est_batch.requires_grad_()
-                print(f"obs_batch.requires_grad: {obs_batch.requires_grad}")
-                print(f"obs_est_batch.requires_grad: {obs_est_batch.requires_grad}")
                 self.policy.act(obs_est_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             else:
                 self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -398,44 +395,39 @@ class AMP:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             # Discriminator loss
-            policy_amp_obs = amp_policy_batch
-            expert_amp_obs = amp_expert_batch
-
-            policy_disc_output = self.discriminator.discriminate(policy_amp_obs)
-            expert_disc_output = self.discriminator.discriminate(expert_amp_obs)
+            policy_disc_output = self.discriminator.discriminate(amp_policy_batch)
+            expert_disc_output = self.discriminator.discriminate(amp_expert_batch)
 
             assert self.amp_cfg is not None, "AMP configuration is not provided."
             if self.disc_cfg["gan_type"] == "vanilla":
                 policy_loss = torch.nn.BCEWithLogitsLoss()(policy_disc_output, torch.zeros(policy_disc_output.size(), device=self.device))
                 expert_loss = torch.nn.BCEWithLogitsLoss()(expert_disc_output, torch.ones(expert_disc_output.size(), device=self.device))
-                grad_pen_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
-                disc_loss = (expert_loss + policy_loss) *0.5
+                disc_loss = (expert_loss + policy_loss) * 0.5
             elif self.disc_cfg["gan_type"] == "lsgan":
                 # LSGAN
                 policy_loss = torch.nn.MSELoss()(
                     policy_disc_output, -1 * torch.ones(policy_disc_output.size(), device=self.device))
                 expert_loss = torch.nn.MSELoss()(
                     expert_disc_output, torch.ones(expert_disc_output.size(), device=self.device))
-                grad_pen_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
-                disc_loss = (expert_loss + policy_loss) *0.5
+                disc_loss = (expert_loss + policy_loss) * 0.5
             elif self.disc_cfg["gan_type"] == "wgan":
                 # WGAN
-                alpha = 0.5 # 0.1 ~ 0.5 is recommended
+                alpha = 0.3 # 0.1 ~ 0.5 is recommended
                 policy_loss = torch.nn.Tanh()(policy_disc_output * alpha).mean()
                 expert_loss = -torch.nn.Tanh()(expert_disc_output * alpha).mean()
-                grad_pen_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
-                disc_loss = (expert_loss + policy_loss) *0.5
+                disc_loss = (expert_loss + policy_loss) * 0.5
             else:
                 assert False, f"Invalid GAN type: {self.disc_cfg['gan_type']}"
 
-            disc_logit_loss = torch.sum(torch.square(self.discriminator.get_logit_weight()))
+            disc_grad_penalty_loss = self.discriminator.compute_grad_pen(amp_expert_batch, lambda_=self.amp_cfg["disc_grad_pen"])
 
+            disc_logit_loss = torch.sum(torch.square(self.discriminator.get_logit_weight()))
             loss = surrogate_loss \
                 + self.value_loss_coef * value_loss \
                 - self.entropy_coef * entropy_batch.mean() \
                 + self.amp_cfg["disc_loss_coef"] * disc_loss \
                 + self.amp_cfg["disc_logit_loss_coef"] * disc_logit_loss \
-                + grad_pen_loss
+                + self.amp_cfg["disc_grad_pen"] * disc_grad_penalty_loss 
             
             # Symmetry loss
             if self.symmetry:
@@ -494,7 +486,6 @@ class AMP:
             # -- For PPO
             self.optimizer.zero_grad()
             loss.backward()
-            print(f"backward done")
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
@@ -517,7 +508,7 @@ class AMP:
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             mean_disc_loss += disc_loss.item()
-            # mean_disc_pen_loss += grad_pen_loss.item()
+            mean_disc_pen_loss += disc_grad_penalty_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
