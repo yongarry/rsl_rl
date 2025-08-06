@@ -289,6 +289,7 @@ class PPO:
                 self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
 
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
+            # actions_mean_batch = self.policy.action_mean.norm(dim=-1)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
@@ -298,7 +299,9 @@ class PPO:
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             if self.use_lcp:
-                gradient_penalty_loss = self._calc_grad_penalty(obs_est_batch, actions_log_prob_batch)
+                gradient_penalty_loss = self._calc_act_log_prob_grad_penalty(obs_est_batch, actions_log_prob_batch)
+                # gradient_penalty_loss = self._calc_grad_penalty_(obs_est_batch, actions_mean_batch)
+
 
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -533,8 +536,13 @@ class PPO:
                 # update the offset for the next parameter
                 offset += numel
 
-    def _calc_grad_penalty(self, obs_batch, actions_log_prob_batch):
-        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True)[0]
+    def _calc_act_log_prob_grad_penalty(self, obs_batch, actions_log_prob_batch, is_lcp=True):
+        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=is_lcp)[0]
+        gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
+        return gradient_penalty_loss
+    
+    def _calc_act_norm_grad_penalty(self, obs_batch, actions_mean_batch):
+        grad_log_prob = torch.autograd.grad(actions_mean_batch.sum(), obs_batch, create_graph=True)[0]
         gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
         return gradient_penalty_loss
     

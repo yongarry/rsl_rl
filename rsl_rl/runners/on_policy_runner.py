@@ -16,6 +16,7 @@ from rsl_rl.algorithms import PPO, Distillation, AMP
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
+    ActorCritic_SN,
     ActorCriticRecurrent,
     EmpiricalNormalization,
     StudentTeacher,
@@ -72,7 +73,7 @@ class OnPolicyRunner:
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+        policy: ActorCritic | ActorCritic_SN | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
@@ -183,6 +184,8 @@ class OnPolicyRunner:
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
+        if self.alg_class_name == "AMP":    
+            amp_rewbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
@@ -263,6 +266,8 @@ class OnPolicyRunner:
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        if self.alg_class_name == "AMP":
+                            amp_rewbuffer.extend(amp_reward[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         # -- intrinsic and extrinsic rewards
@@ -368,6 +373,8 @@ class OnPolicyRunner:
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            if self.alg_class_name == "AMP":
+                self.writer.add_scalar("Train/mean_amp_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
                 self.writer.add_scalar(
@@ -394,6 +401,8 @@ class OnPolicyRunner:
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
                 )
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+            if self.alg_class_name == "AMP":
+                log_string += f"""{'Mean amp reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.2f}\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
         else:

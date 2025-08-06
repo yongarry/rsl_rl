@@ -99,11 +99,12 @@ class Discriminator(nn.Module):
         demo_amp_obs_est = self.amp_normalizer(demo_amp_obs_est)
         demo_amp_obs_est.requires_grad_()
         disc = self.disc(demo_amp_obs_est)
-        ones = torch.ones(disc.size(), device=disc.device)
         grad = torch.autograd.grad( # Computes the gradients of outputs w.r.t. inputs.
             outputs=disc, inputs=demo_amp_obs_est,
-            grad_outputs=ones, create_graph=True,
-            retain_graph=True, only_inputs=True)[0] # the index [0] indicates gradient w.r.t. the first input. For multiple inputs, use inputs=[input1, input2]
+            grad_outputs=torch.ones(disc.size(), device=disc.device), 
+            create_graph=True,
+            retain_graph=True, 
+            only_inputs=True)[0] # the index [0] indicates gradient w.r.t. the first input. For multiple inputs, use inputs=[input1, input2]
 
         # Enforce that the grad norm approaches 0.
         grad_pen = lambda_ * (grad.norm(2, dim=1) - 0).pow(2).mean()
@@ -112,13 +113,15 @@ class Discriminator(nn.Module):
     
     def compute_grad_pen_interpolate(self, expert_amp_obs, policy_amp_obs, lambda_=10):
         interpolate_data = slerp(expert_amp_obs, policy_amp_obs, torch.rand((expert_amp_obs.shape[0], 1)))
-
-        disc = self.discriminate(interpolate_data)
-        ones = torch.ones(disc.size(), device=disc.device)
+        interpolate_data = self.amp_normalizer(interpolate_data)
+        interpolate_data.requires_grad_()
+        disc_output = self.disc(interpolate_data)
         grad = torch.autograd.grad( # Computes the gradients of outputs w.r.t. inputs.
-            outputs=disc, inputs=interpolate_data,
-            grad_outputs=ones, create_graph=True,
-            retain_graph=True, only_inputs=True)[0] # the index [0] indicates gradient w.r.t. the first input. For multiple inputs, use inputs=[input1, input2]
+            outputs=disc_output, inputs=interpolate_data,
+            grad_outputs=torch.ones(disc_output.size(), device=disc_output.device), 
+            create_graph=True,
+            retain_graph=True, 
+            only_inputs=True)[0] # the index [0] indicates gradient w.r.t. the first input. For multiple inputs, use inputs=[input1, input2]
 
         # Enforce that the grad norm approaches 0.
         # grad_pen = lambda_ * (grad.norm(2, dim=1) - 0).pow(2).mean()

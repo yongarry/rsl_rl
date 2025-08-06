@@ -170,6 +170,7 @@ class ActorCritic_SN(ActorCritic):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__(num_actor_obs, num_critic_obs, num_actions, actor_hidden_dims, critic_hidden_dims, activation, init_noise_std, noise_std_type, **kwargs)
+        activation = resolve_nn_activation(activation)
 
         # replace the actor and critic with spectral norm layers
         mlp_input_dim_a = num_actor_obs
@@ -205,14 +206,6 @@ class ActorCritic_SN(ActorCritic):
 ########################################################################################################
 # spectral norm layers
 ########################################################################################################
-
-def sn_scaled_linear(input_size, unit, lipschitz_constant=1.0):
-    layer = nn.utils.spectral_norm(nn.Linear(input_size, unit)) #, eps=1e-6)
-    return ScaledLinear(layer, lipschitz_constant)
-
-def sn_linear(input_size, unit):
-    return nn.utils.spectral_norm(nn.Linear(input_size, unit))#, eps=1e-6)
-
 class ScaledLinear(nn.Module):
     """Wrapper to scale the output of spectral norm layers"""
     def __init__(self, layer, lipschitz_constant):
@@ -245,4 +238,11 @@ class ScaledLinear(nn.Module):
     @property
     def bias(self):
         """Expose the bias of the underlying layer (if exists)"""
-        return self.layer.bias  
+        return self.layer.bias
+    
+def sn_scaled_linear(input_size, unit, lipschitz_constant=1.0):
+    layer = nn.utils.spectral_norm(nn.Linear(input_size, unit)) #, eps=1e-6)
+    return ScaledLinear(layer, lipschitz_constant)
+
+def sn_linear(input_size, unit):
+    return nn.utils.spectral_norm(nn.Linear(input_size, unit))#, eps=1e-6)
