@@ -216,8 +216,11 @@ class PPO:
         # -- LCP loss
         if self.use_lcp:
             mean_gradient_penalty_loss = 0
+            # mean_act_gp_loss = 0
+            # mean_sig_gp = 0
         else:
             mean_gradient_penalty_loss = None
+            # mean_act_gp_loss = None
         # -- Bound loss
         if self.use_bound_loss:
             mean_bound_loss = 0
@@ -289,7 +292,7 @@ class PPO:
                 self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
 
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            # actions_mean_batch = self.policy.action_mean.norm(dim=-1)
+            actions_mean_batch = self.policy.action_mean.norm(dim=-1)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
@@ -299,8 +302,11 @@ class PPO:
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             if self.use_lcp:
-                gradient_penalty_loss = self._calc_act_log_prob_grad_penalty(obs_est_batch, actions_log_prob_batch)
-                # gradient_penalty_loss = self._calc_grad_penalty_(obs_est_batch, actions_mean_batch)
+                # sig_gradient = torch.autograd.grad(sigma_batch, obs_est_batch, create_graph=False, retain_graph=True)[0]
+                # for i in range(0, 12):
+                    # act_gp_loss += self._calc_act_grad_penalty(obs_est_batch, actions_mean_batch[:, i], True)
+                # act_gp_loss = self._calc_act_grad_penalty(obs_est_batch, actions_mean_batch, True)
+                lcp_gp_loss = self._calc_act_log_prob_grad_penalty(obs_est_batch, actions_log_prob_batch, self.use_lcp["is_lcp"])
 
 
             # KL
@@ -407,11 +413,14 @@ class PPO:
 
             if self.use_lcp:
                 gradient_penalty_coef = self.use_lcp["gradient_penalty_coef"]
-                loss += gradient_penalty_coef * gradient_penalty_loss
+                if self.use_lcp["is_lcp"]:
+                    loss += gradient_penalty_coef * lcp_gp_loss
+                # loss += gradient_penalty_coef * act_gp_loss
 
             if self.use_bound_loss:
                 bound_loss_coef = self.use_bound_loss["bound_loss_coef"]
-                bound_loss = self.bound_loss(mu_batch)
+                soft_bound = self.use_bound_loss["bound_range"]
+                bound_loss = self.bound_loss(mu_batch, soft_bound)
                 loss += bound_loss_coef * bound_loss 
 
             # Compute the gradients
@@ -447,7 +456,9 @@ class PPO:
                 mean_symmetry_loss += symmetry_loss.item()
             # -- LCP loss
             if mean_gradient_penalty_loss is not None:
-                mean_gradient_penalty_loss += gradient_penalty_loss.item()
+                mean_gradient_penalty_loss += lcp_gp_loss.item()
+                # mean_act_gp_loss += act_gp_loss.item()
+                # mean_sig_gp += sig_gradient.item()
             # -- Bound loss
             if mean_bound_loss is not None:
                 mean_bound_loss += bound_loss.item()
@@ -466,6 +477,8 @@ class PPO:
         # -- For LCP
         if mean_gradient_penalty_loss is not None:
             mean_gradient_penalty_loss /= num_updates
+            # mean_act_gp_loss /= num_updates
+            # mean_sig_gp /= num_updates
         # -- For Bound loss
         if mean_bound_loss is not None:
             mean_bound_loss /= num_updates
@@ -484,6 +497,8 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if self.use_lcp:
             loss_dict["lcp"] = mean_gradient_penalty_loss
+            # loss_dict["lcp_act"] = mean_act_gp_loss
+            # loss_dict["lcp_sig"] = mean_sig_gp
         if self.use_bound_loss:
             loss_dict["bound"] = mean_bound_loss
 
@@ -536,18 +551,17 @@ class PPO:
                 # update the offset for the next parameter
                 offset += numel
 
-    def _calc_act_log_prob_grad_penalty(self, obs_batch, actions_log_prob_batch, is_lcp=True):
-        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=is_lcp)[0]
+    def _calc_act_log_prob_grad_penalty(self, obs_batch, actions_log_prob_batch, is_loss=True):
+        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=is_loss, retain_graph=True)[0]
         gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
         return gradient_penalty_loss
     
-    def _calc_act_norm_grad_penalty(self, obs_batch, actions_mean_batch):
-        grad_log_prob = torch.autograd.grad(actions_mean_batch.sum(), obs_batch, create_graph=True)[0]
+    def _calc_act_grad_penalty(self, input_batch, output_batch, is_loss=True):
+        grad_log_prob = torch.autograd.grad(output_batch.sum(), input_batch, create_graph=is_loss, retain_graph=True)[0]
         gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
         return gradient_penalty_loss
     
-    def bound_loss(self, mu):
-        soft_bound = self.use_bound_loss["bound_range"]
+    def bound_loss(self, mu, soft_bound):
         mu_loss_high = torch.clamp_min(mu - soft_bound, 0.0)**2
         mu_loss_low = torch.clamp_max(mu + soft_bound, 0.0)**2
         b_loss = (mu_loss_low + mu_loss_high).sum()

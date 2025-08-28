@@ -137,6 +137,11 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+    # if class is destroyed, stop the self.writer
+    def __del__(self):
+        if self.writer is not None:
+            self.writer.stop()
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -208,6 +213,10 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            ## update SN coefficients if using learn SN
+            if self.alg.policy.__class__.__name__ == "ActorCritic_SN":
+                if self.alg.policy.schedule == "learn":
+                    self.alg.policy.actor[-1].lipschitz_update(self.alg.policy.lipschitz_coefficient * self.alg.policy.std)
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -315,6 +324,7 @@ class OnPolicyRunner:
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            self.writer.stop()
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
