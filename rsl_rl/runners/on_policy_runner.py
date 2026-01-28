@@ -216,7 +216,7 @@ class OnPolicyRunner:
             ## update SN coefficients if using learn SN
             if self.alg.policy.__class__.__name__ == "ActorCritic_SN":
                 if self.alg.policy.schedule == "learn":
-                    self.alg.policy.actor[-1].lipschitz_update(self.alg.policy.lipschitz_coefficient * self.alg.policy.std)
+                    self.alg.policy.actor[-1].lipschitz_update(self.alg.policy.lipschitz_coefficient * self.alg.policy.std.detach())
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):

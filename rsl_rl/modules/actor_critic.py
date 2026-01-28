@@ -70,6 +70,8 @@ class ActorCritic(nn.Module):
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        elif self.noise_std_type == "fixed":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions, requires_grad=False), requires_grad=False)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
@@ -108,7 +110,7 @@ class ActorCritic(nn.Module):
         # compute mean
         mean = self.actor(observations)
         # compute standard deviation
-        if self.noise_std_type == "scalar":
+        if self.noise_std_type == "scalar" or self.noise_std_type == "fixed":
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
@@ -173,6 +175,10 @@ class ActorCritic_SN(ActorCritic):
         activation = resolve_nn_activation(activation)
 
         # replace the actor and critic with spectral norm layers
+
+        self.schedule = kwargs.get("schedule", "fixed")
+        self.lipschitz_coefficient = kwargs.get("lipschitz_coefficient", 1.0)
+
         mlp_input_dim_a = num_actor_obs
         # Policy
         actor_layers = []
@@ -180,14 +186,15 @@ class ActorCritic_SN(ActorCritic):
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(sn_scaled_linear(actor_hidden_dims[layer_index], num_actions, lipschitz_constant))
+                if self.schedule == "fixed":
+                    actor_layers.append(sn_scaled_linear(actor_hidden_dims[layer_index], num_actions, lipschitz_constant))
+                else:
+                    actor_layers.append(sn_scaled_linear(actor_hidden_dims[layer_index], num_actions, self.std * self.lipschitz_coefficient))
             else:
                 actor_layers.append(sn_linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
         self.actor = nn.Sequential(*actor_layers)
 
-        self.schedule = kwargs.get("schedule", "fixed")
-        self.lipschitz_coefficient = kwargs.get("lipschitz_coefficient", 1.0)
 
         # # Value function
         # mlp_input_dim_c = num_critic_obs
